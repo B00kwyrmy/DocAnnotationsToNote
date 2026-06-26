@@ -1,0 +1,21 @@
+node_modules/
+build/
+.gradle/
+android/.gradle/
+android/build/
+.env
+.DS_Store
+
+# releases/ is intentionally tracked — .snplg files belong in version control
+package-lock.json
+
+android/app.zip
+app.npk
+
+# Stray ExportColorPDF files that ended up in this folder (cloned from ECP) — not part of this plugin
+ExportColorPDFCombined.snplg
+ExportColorPDFv2.2.zip
+Export Color PDF User Instructions v2.5.docx
+BUSINESS_RULES_AND_FLOW.md
+PROGRAMMING_DETAILS.md
+releases/v2.0.0/

@@ -1,0 +1,10 @@
+{
+  "name": "Doc Annotations To Note",
+  "desc": "Extracts a marked-up PDF's annotations (highlights, underlines, circled regions, paren/brace-wrapped text, handwriting) into the current note, in document reading order.",
+  "iconPath": "assets/icon.png",
+  "versionName": "1.0.0",
+  "versionCode": "2",
+  "pluginID": "docannot2notev1",
+  "pluginKey": "DocAnnotationsToNote",
+  "jsMainPath": "index"
+}

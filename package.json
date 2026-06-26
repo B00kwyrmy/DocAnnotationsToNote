@@ -1,0 +1,20 @@
+{
+  "name": "DocAnnotationsToNote",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "./buildPlugin.sh",
+    "start": "react-native start"
+  },
+  "dependencies": {
+    "react": "19.0.0",
+    "react-native": "0.79.2",
+    "sn-plugin-lib": "^0.1.43"
+  },
+  "devDependencies": {
+    "@react-native-community/cli": "latest",
+    "@react-native/metro-config": "^0.85.3",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.0.0"
+  }
+}
