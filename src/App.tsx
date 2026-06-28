@@ -92,7 +92,13 @@ function classify(penType: number, b: any): string {
   if (h <= 25 && asp >= 8) return 'underline';            // wide & short
   return 'ambig';  // other pen strokes — paren OR handwriting; resolved by clustering below
 }
-const pendingPath = (exportDir: string) => `${exportDir}/docnote_pending.json`;
+// Intermediate scratch (crops, resizes, debug, hand-off) lives in a NON-SYNCING top-level folder.
+// Supernote Cloud only pushes MyStyle/INBOX/EXPORT/Document/Note/Screenshot, so PluginData/ stays
+// off the cloud (and out of EXPORT). Still shared storage, so ExportColorPDF can read the color crops.
+const workDir = (exportDir: string) => `${exportDir.replace(/\/EXPORT\/?$/, '')}/PluginData/DocAnnotationsToNote`;
+const pendingPath = (exportDir: string) => `${workDir(exportDir)}/docnote_pending.json`;
+// Testing flag: true keeps every run's scratch (no purge); false (release) wipes the prior run at phase-1 entry.
+const KEEP_HISTORY = false;
 // Parse a human "specific pages" spec (1-based, e.g. "3-7, 9") → 0-based page indices.
 function parseRange(spec: string): number[] {
   const out = new Set<number>();
@@ -124,6 +130,10 @@ export default function App() {
     // region as an IMAGE from the rendered page (which generateDocImage produces for EPUB too).
     const isEpub = !/\.pdf$/i.test(pdfPath);
     log(`docType = ${isEpub ? 'EPUB/DOC (image-crop mode)' : 'PDF (text-lift mode)'}`);
+    // Disk hygiene: wipe the PRIOR run's scratch so per-annotation files never pile up. The CURRENT
+    // run's crops are rewritten below and kept (ExportColorPDF reads them for the color pass).
+    const wd = workDir(exportDir);
+    if (!KEEP_HISTORY) await settle(RN.deletePath(wd));
     // Resolve the scope ("what to move to the note") → the page list to scan.
     let pages: number[] = [];
     if (scope.kind === 'current') {
@@ -182,7 +192,7 @@ export default function App() {
     // padX/padY default to PAD; highlights pass a TINY padY so the crop hugs the swiped line
     // instead of grabbing slivers of the lines above/below (a text line is only ~34px tall).
     const cropColor = async (p: number, b: any, cW: number, cH: number, padX = PAD, padY = PAD) => {
-      const out = `${exportDir}/docnote_crop_${cropN++}_${stamp}.png`;
+      const out = `${wd}/docnote_crop_${cropN++}_${stamp}.png`;
       const x = b.minX - padX, y = b.minY - padY;
       const w = (b.maxX - b.minX) + 2 * padX, h = (b.maxY - b.minY) + 2 * padY;
       const r = colorPng(p)
@@ -190,10 +200,22 @@ export default function App() {
         : await settle(RN.cropRegionToPng(pdfPath, p, cW, cH, x, y, w, h, out));
       return r.ok ? out : null;
     };
+    // CONTEXT STRIP — for handwriting / margin notes: crop the FULL canvas width of the device's
+    // COLOURED render across the writing's line(s), so the note shows in place (beside the name etc.)
+    // with the ink rendered exactly as the device draws it. byIndex is now gated in the exporter, so
+    // this no longer inherits ghost/rainbow colours. Full width (0..cW) so right-margin writing isn't
+    // clipped — then TRIM the blank page margins so the content sits flush-left (no half-inch indent).
+    const contextStrip = async (p: number, b: any, cW: number, cH: number) => {
+      const raw = await cropColor(p, { minX: 0, minY: b.minY, maxX: cW, maxY: b.maxY }, cW, cH, 0, 16);
+      if (!raw) return null;
+      const out = `${wd}/docnote_crop_${cropN++}_${stamp}.png`;
+      const r = await settle(RN.trimPng(raw, out, 10));
+      return (r.ok && r.val) ? out : raw;
+    };
     // bare crop (from the plain PDF, no annotation strokes) — for circles: capture the
     // CONTENT inside the loop without drawing the circle itself.
     const cropBare = async (p: number, b: any, cW: number, cH: number) => {
-      const out = `${exportDir}/docnote_crop_${cropN++}_${stamp}.png`;
+      const out = `${wd}/docnote_crop_${cropN++}_${stamp}.png`;
       const x = b.minX - PAD, y = b.minY - PAD;
       const w = (b.maxX - b.minX) + 2 * PAD, h = (b.maxY - b.minY) + 2 * PAD;
       const r = await settle(RN.cropRegionToPng(pdfPath, p, cW, cH, x, y, w, h, out));
@@ -204,7 +226,7 @@ export default function App() {
     const M = 8;   // small margin
     const renderInk = async (b: any, polys: number[][], hex?: string | null, wash = false) => {
       if (!polys || !polys.length) return null;
-      const out = `${exportDir}/docnote_crop_${cropN++}_${stamp}.png`;
+      const out = `${wd}/docnote_crop_${cropN++}_${stamp}.png`;
       const w = (b.maxX - b.minX) + 2 * M, h = (b.maxY - b.minY) + 2 * M;
       const color = hex || '#202020';        // pen ink default = near-black
       const alpha = wash ? 115 : 255;         // highlighter doodle = translucent wash; pen ink = opaque
@@ -406,11 +428,11 @@ export default function App() {
         // lasso shape itself is never reproduced.
         else if (kind === 'enclosure') {
           if (isEpub) {   // EPUB: no text layer / no bare-PDF render → crop the enclosed region as an image
-            items.push({ page: p, y: b.minY, x: b.minX, kind, image: await cropColor(p, b, cW, cH, 10, 10), region: { ...b } });
+            items.push({ page: p, y: b.minY, y2: b.maxY, x: b.minX, kind, image: await cropColor(p, b, cW, cH, 10, 10), region: { ...b } });
           } else {
             const eb = (await pageData(p, cW, cH)).bands;
             const { oy, cy } = insideSpanY(eb, b.minY, b.maxY);   // skip the line the loop only arcs over
-            items.push({ page: p, y: b.minY, x: b.minX, kind,
+            items.push({ page: p, y: b.minY, y2: b.maxY, x: b.minX, kind,
               image: await cropBare(p, b, cW, cH),
               spanIdx: addSpan(p, cW, cH, b.minX, oy, b.maxX, cy) });
           }
@@ -438,7 +460,7 @@ export default function App() {
             brk.sort((a: any, b: any) => a.minX - b.minX);
             const o = brk[0], c = brk[brk.length - 1];
             const box = spanRegionBox(Math.min(o.minY, c.minY), Math.max(o.maxY, c.maxY), o.maxX, c.minX, cW);
-            items.push({ page: p, y: u.minY, x: u.minX, kind: 'paren',
+            items.push({ page: p, y: u.minY, y2: u.maxY, x: u.minX, kind: 'paren',
               ...(await liftText(p, cW, cH, o.maxX, (o.minY + o.maxY) / 2, c.minX, (c.minY + c.maxY) / 2, box)) });
             continue;
           }
@@ -450,18 +472,16 @@ export default function App() {
           // asp≤2.5 enclosure test). Lift the enclosed text; never reproduce the loop. (A real
           // handwritten note is many strokes → g.length>2 → stays a crop, not mistaken for this.)
           if (isEpub) {   // EPUB: crop the lassoed region as an image (no text layer / no bare-PDF render)
-            items.push({ page: p, y: u.minY, x: u.minX, kind: 'enclosure', image: await cropColor(p, u, cW, cH, 10, 10), region: { ...u } });
+            items.push({ page: p, y: u.minY, y2: u.maxY, x: u.minX, kind: 'enclosure', image: await cropColor(p, u, cW, cH, 10, 10), region: { ...u } });
           } else {
             const { oy, cy } = insideSpanY((await pageData(p, cW, cH)).bands, u.minY, u.maxY);   // skip arc-over lines
-            items.push({ page: p, y: u.minY, x: u.minX, kind: 'enclosure',
+            items.push({ page: p, y: u.minY, y2: u.maxY, x: u.minX, kind: 'enclosure',
               image: await cropBare(p, u, cW, cH),
               spanIdx: addSpan(p, cW, cH, u.minX, oy, u.maxX, cy) });
           }
-        } else {   // handwriting → ink ONLY (no printed-text background), in the pen's colour; crop fallback if no contours
-          const polys = g.flatMap((s: any) => s.polys || []);
-          const hex = g.find((s: any) => s.colorHex)?.colorHex || null;
-          const ink = await renderInk(u, polys, hex, false);
-          items.push({ page: p, y: u.minY, x: u.minX, kind: 'handwriting', image: ink || await cropColor(p, u, cW, cH) });
+        } else {   // handwriting → full-width context strip from the coloured render (ink shown in place)
+          items.push({ page: p, y: u.minY, y2: u.maxY, x: u.minX, kind: 'handwriting',
+            image: await contextStrip(p, u, cW, cH) || await cropColor(p, u, cW, cH) });
         }
       }
       // Match sides by SHAPE: classify each as `(` or `)`, then walk them in READING ORDER
@@ -493,9 +513,16 @@ export default function App() {
         if (s.minY - o.minY > PAREN_MAX_VSPAN) { stack.push(o); continue; }  // too tall → keep `(` for a nearer `)`
         const Oc = (o.minY + o.maxY) / 2, Cc = (s.minY + s.maxY) / 2;
         o._used = s._used = true;
+        // Tall `(` / `)` brackets that enclose a MULTI-line passage have centers close together (both
+        // near the same baseline), so anchoring at the centers collapses the span to one line and only
+        // a few words come through. When the brackets are on different lines, push the OPEN anchor
+        // toward its top line and the CLOSE anchor toward its bottom line so the whole passage is read.
+        const multi = Math.abs(Cc - Oc) > 28;
+        const oY = multi ? o.minY + (o.maxY - o.minY) * 0.25 : Oc;
+        const cY = multi ? s.minY + (s.maxY - s.minY) * 0.75 : Cc;
         const box = spanRegionBox(Math.min(o.minY, s.minY), Math.max(o.maxY, s.maxY), o.maxX, s.minX, cW);
-        items.push({ page: p, y: o.minY, x: Math.min(o.minX, s.minX), kind: 'paren',
-          ...(await liftText(p, cW, cH, o.maxX, Oc, s.minX, Cc, box)) });
+        items.push({ page: p, y: o.minY, y2: o.maxY, x: Math.min(o.minX, s.minX), kind: 'paren',
+          ...(await liftText(p, cW, cH, o.maxX, oY, s.minX, cY, box)) });
       }
       for (const s of sides) if (!s._used) {   // unmatched PEN bracket → DROP (a stray lone `(`/`)`).
         // (Pen-colour MARKER brackets are handled separately as margin-bracket text lifts.)
@@ -512,7 +539,7 @@ export default function App() {
           const x0 = dir === ')' ? 90 : bk.maxX;
           const x1 = dir === ')' ? bk.minX : (cW - 90);
           const box = spanRegionBox(bk.minY, bk.maxY, Math.min(x0, x1), Math.max(x0, x1), cW);
-          items.push({ page: p, y: bk.minY, x: bk.minX, kind: 'paren', ...(await liftText(p, cW, cH, x0, oy, x1, cy, box)) });
+          items.push({ page: p, y: bk.minY, y2: bk.maxY, x: bk.minX, kind: 'paren', ...(await liftText(p, cW, cH, x0, oy, x1, cy, box)) });
           dbg.push({ pg: p, pt: -94, k: `marker-bracket-lift dir=${dir}`, x0: bk.minX, y0: bk.minY, x1: bk.maxX, y1: bk.maxY });
         }
       }
@@ -524,12 +551,23 @@ export default function App() {
       // One box per underlined LINE (merge same-line segments), then STITCH consecutive lines
       // that WRAP — upper reaches toward the right margin, lower starts near the left — into a
       // single multi-line underline so the whole underlined sentence is ONE entry.
-      const lineRuns = clusterGroups(underlines, 45).map((g: any) => unionBox(g)).sort((a: any, b: any) => a.minY - b.minY);
+      // One box per underlined LINE: group same-line segments (within ~14px vertically) but keep
+      // separate lines apart. clusterGroups' margin applies to BOTH axes, so a 45px margin merged
+      // adjacent lines (~30px apart) into one multi-line blob — which then collapsed to a single-line
+      // span, so only the FIRST underlined line came through. Group by baseline instead.
+      const byLine: any[][] = [];
+      for (const b of underlines.slice().sort((a: any, c: any) => a.minY - c.minY)) {
+        const g = byLine[byLine.length - 1];
+        if (g && b.minY - g[0].minY <= 14) g.push(b);   // same line (segments of one underline)
+        else byLine.push([b]);                          // a new line
+      }
+      const lineRuns = byLine.map((g: any) => unionBox(g));
       const stitched: any[][] = [];
       for (const r of lineRuns) {
         const grp = stitched[stitched.length - 1];
         const prev = grp && grp[grp.length - 1];
-        if (prev && r.minY - prev.maxY <= 25 && prev.maxX >= cW * 0.5 && r.minX <= cW * 0.4) grp.push(r);
+        // consecutive lines that WRAP (upper reaches the right, lower starts at the left) → one entry
+        if (prev && r.minY - prev.maxY <= 35 && prev.maxX >= cW * 0.5 && r.minX <= cW * 0.4) grp.push(r);
         else stitched.push([r]);
       }
       for (const grp of stitched) {
@@ -539,7 +577,7 @@ export default function App() {
         // run wraps across lines, else hug the single underlined line).
         const multi = (bot.minY - top.minY) > 30;
         const box = { minX: multi ? 92 : top.minX, minY: top.minY - 62, maxX: multi ? cW - 80 : bot.maxX, maxY: bot.minY + 6 };
-        items.push({ page: p, y: u.minY, x: u.minX, kind: 'underline',
+        items.push({ page: p, y: u.minY, y2: u.maxY, x: u.minX, kind: 'underline',
           ...(await liftText(p, cW, cH, top.minX, top.minY, bot.maxX, bot.minY, box, true)) });
       }
       // HIGHLIGHTS → cluster ONLY same-line segments (margin 18 < line pitch, so separate lines
@@ -567,7 +605,7 @@ export default function App() {
           const sn = snapYToBands(hlData.bands, us.minY, us.maxY);   // overlapping OR nearest line; null only if page is textless
           cropBox = sn ? { ...epubX(sn, us.minX, us.maxX), minY: sn.minY, maxY: sn.maxY } : us;
         } else cropBox = snapBox(hlData, us);
-        items.push({ page: p, y: u.minY, x: u.minX, kind: 'highlight', image: await cropColor(p, cropBox, cW, cH, 0, 0) });
+        items.push({ page: p, y: u.minY, y2: u.maxY, x: u.minX, kind: 'highlight', image: await cropColor(p, cropBox, cW, cH, 0, 0) });
       }
       // Highlighter DOODLES (big loopy marks, not flat swipes) → ink ONLY, no printed background.
       // Cluster loosely (80px) so a multi-stroke drawing stays one image; crop fallback if no contours.
@@ -575,7 +613,7 @@ export default function App() {
         const u = unionBox(g);
         const polys = g.flatMap((s: any) => s.polys || []);
         const hex = g.find((s: any) => s.colorHex)?.colorHex || null;   // doodle's highlighter colour
-        items.push({ page: p, y: u.minY, x: u.minX, kind: 'handwriting', image: await renderInk(u, polys, hex, true) || await cropColor(p, u, cW, cH) });
+        items.push({ page: p, y: u.minY, y2: u.maxY, x: u.minX, kind: 'handwriting', image: await renderInk(u, polys, hex, true) || await cropColor(p, u, cW, cH) });
       }
     }
 
@@ -621,7 +659,7 @@ export default function App() {
           if (scope.kind === 'new' && seen.has(dsig)) continue;
           seenNow.add(dsig);
           // EPUB: crop the highlighted region as an image (the digest wash is already drawn on the render)
-          items.push({ page: pg, y: u.minY, x: u.minX, kind: 'digest', ...(await liftText(pg, sz.width, sz.height, ox, oy, cx, cy, { ...u })) });
+          items.push({ page: pg, y: u.minY, y2: u.maxY, x: u.minX, kind: 'digest', ...(await liftText(pg, sz.width, sz.height, ox, oy, cx, cy, { ...u })) });
           dbg.push({ pg, pt: -1, k: 'digest', x0: u.minX, y0: u.minY, x1: u.maxX, y1: u.maxY });
           dcount++;
         }
@@ -710,7 +748,16 @@ export default function App() {
       if (drop.size) { const kept = items.filter((_, idx) => !drop.has(idx)); items.length = 0; items.push(...kept); }
     }
 
-    items.sort((a, b) => a.page - b.page || a.y - b.y || a.x - b.x);
+    // Reading order by the item's CENTER y (not its top): a tall margin note written next to a line
+    // starts higher than the line but is centered on it — center-sorting keeps it WITH that line
+    // instead of floating above the items before it. Items on ~the same row order left-to-right, so a
+    // right-margin note follows the text it annotates.
+    items.sort((a, b) => {
+      if (a.page !== b.page) return a.page - b.page;
+      const ac = (a.y + (a.y2 ?? a.y)) / 2, bc = (b.y + (b.y2 ?? b.y)) / 2;
+      if (Math.abs(ac - bc) > 32) return ac - bc;
+      return a.x - b.x;
+    });
     // ACCUMULATE the seen-marks (union of prior + this run) so a later "New annotations" run
     // compares against everything ever extracted — not just this run (which would lose history).
     try { await settle(RN.writeFile(manifestPath, JSON.stringify([...new Set([...seen, ...seenNow])]))); } catch {}
@@ -721,7 +768,7 @@ export default function App() {
     }
     const payload = { sourceName: baseName(pdfPath), when: new Date().toISOString(), items };
     await settle(RN.writeFile(pendingPath(exportDir), JSON.stringify(payload)));
-    await settle(RN.writeFile(`${exportDir}/docnote_debug_${Date.now()}.json`, JSON.stringify(dbg)));   // diagnostic
+    await settle(RN.writeFile(`${wd}/docnote_debug_${Date.now()}.json`, JSON.stringify(dbg)));   // diagnostic (non-syncing workDir)
     log(`\nExtracted ${items.length} items (saved).`);
     log(`NOW: open your "— Extracts" note and tap Doc → Note again to paste.`);
   }
@@ -729,6 +776,7 @@ export default function App() {
   // ── PHASE 2: in a NOTE → paste the pending extract (builds the note only) ──
   // Color PDF/PNG output is handled separately by ExportColorPDF run on the finished note.
   async function phase2(notePath: string, exportDir: string) {
+    const wd = workDir(exportDir);   // resized crops live in the same non-syncing folder as phase-1 scratch
     log('PHASE 2 — pasting into note…');
     const raw = (await settle(RN.readFile(pendingPath(exportDir)))).val;
     if (!raw) { log('No pending extract found. Run from the annotated PDF first.'); return; }
@@ -743,7 +791,7 @@ export default function App() {
     const sz = unpack(await settle(PluginFileAPI.getPageSize(notePath, 0)).then((x) => x.val)).val;
     const PW = sz?.width || 1404, PH = sz?.height || 1872;
     const LEFT = 130, RIGHT = PW - 90, WIDTH = RIGHT - LEFT;     // bigger left margin (portrait clipping)
-    const FONT = 32, LINE = 46, GAP = 70, TOP = 120, BOTTOM = PH - 90;
+    const FONT = 32, LINE = 46, GAP = 3 * 46, TOP = 120, BOTTOM = PH - 90;   // ≥3 lines between entries: the on-device note clips an element's bottom when the next one crowds it
     const cpl = Math.max(20, Math.floor(WIDTH / (FONT * 0.52)));
 
     // blank/white template NAME (insertNotePage wants template: string, the name)
@@ -758,15 +806,28 @@ export default function App() {
     const header = `Extracts from "${payload.sourceName}.pdf" · ${(payload.when || '').slice(0, 10)}`;
     const seq: any[] = [{ t: 'text', s: header }];
     for (const it of items) {
-      if (it.image) seq.push({ t: 'img', s: it.image });          // highlight / handwriting / circle
-      else if (it.text) seq.push({ t: 'text', s: it.kind === 'digest' ? `[D] ${it.text}` : it.text, bold: it.bold });  // [D] tags a digest; bold = header
+      const geo = { kind: it.kind, sx: it.x, sy: it.y, sy2: it.y2 };   // carry source position for margin-note layout
+      if (it.image) seq.push({ t: 'img', s: it.image, ...geo });          // highlight / handwriting / circle
+      else if (it.text) seq.push({ t: 'text', s: it.kind === 'digest' ? `[D] ${it.text}` : it.text, bold: it.bold, ...geo });  // [D] tags a digest; bold = header
     }
+    let rsN = 0;
     for (const item of seq) {
       if (item.t !== 'img') continue;
       const pi = (await settle(RN.pngInfo(item.s))).val || {};
       const iw = pi.width || 600, ih = pi.height || 400;
-      const sc = Math.min(1, WIDTH / iw);
+      // Writing strips run nearly edge-to-edge, so the last letters sit right at the margin. Cap
+      // handwriting strips at 87% of the column → a right-hand safety margin.
+      const cap = item.kind === 'handwriting' ? WIDTH * 0.87 : WIDTH;
+      const sc = Math.min(1, cap / iw);
       item.iw = Math.round(iw * sc); item.ih = Math.round(ih * sc);
+      // The note places a picture at its NATIVE pixel size and CLIPS to the element box (it does NOT
+      // scale to fit) — so a strip wider than its box loses its right edge on-device (the export PDF
+      // re-renders scaled, which hid this). Physically resize the image to the display size so its
+      // native size == the box and nothing is clipped.
+      if (sc < 1) {
+        const rs = `${wd}/docnote_rs_${rsN++}_${Date.now()}.png`;
+        if ((await settle(RN.resizePng(item.s, rs, item.iw, item.ih))).ok) item.s = rs;
+      }
     }
 
     // 2. layout simulation (pure JS) → assign each item a page + top
@@ -791,8 +852,9 @@ export default function App() {
       for (const item of seq.filter((s: any) => s.page === p)) {
         const el = unpack((await settle(PluginCommAPI.createElement(item.t === 'text' ? 500 : 200))).val).val;
         if (!el) { err++; continue; }
-        if (item.t === 'text') el.textBox = { textContentFull: item.s, textRect: { left: LEFT, top: item.top, right: RIGHT, bottom: item.top + item.h }, fontSize: FONT, textAlign: 0, textBold: item.bold ? 1 : 0, textFakeBold: item.bold ? 1 : 0 };
-        else el.picture = { picturePath: item.s, rect: { left: LEFT, top: item.top, right: LEFT + item.iw, bottom: item.top + item.ih } };
+        const L = item.left ?? LEFT;
+        if (item.t === 'text') el.textBox = { textContentFull: item.s, textRect: { left: L, top: item.top, right: RIGHT, bottom: item.top + item.h }, fontSize: FONT, textAlign: 0, textBold: item.bold ? 1 : 0, textFakeBold: item.bold ? 1 : 0 };
+        else el.picture = { picturePath: item.s, rect: { left: L, top: item.top, right: L + item.iw, bottom: item.top + item.ih } };
         el.pageNum = p;
         els.push(el);
       }
@@ -805,7 +867,7 @@ export default function App() {
     // PICTURE MANIFEST: the note bakes pictures to a grayscale raster and DROPS picturePath,
     // so ExportColorPDF can't recover the crops from getElements. Hand it the crop paths +
     // positions directly → it redraws the COLOUR crops over the note export.
-    const pics = seq.filter((s: any) => s.t === 'img').map((s: any) => ({ page: s.page, left: LEFT, top: s.top, right: LEFT + s.iw, bottom: s.top + s.ih, path: s.s }));
+    const pics = seq.filter((s: any) => s.t === 'img').map((s: any) => { const L = s.left ?? LEFT; return ({ page: s.page, left: L, top: s.top, right: L + s.iw, bottom: s.top + s.ih, path: s.s }); });
     await settle(RN.writeFile(`${exportDir}/.ccp/docnote_pictures.json`, JSON.stringify({ notePath, pictures: pics })));
 
     // Hand-off to ExportColorPDF: write a pass file naming this plugin + the built note, so

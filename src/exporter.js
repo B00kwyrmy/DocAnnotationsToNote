@@ -346,15 +346,15 @@ async function buildDocShapes(elements, page, sidecar, drawUncolored, xform = nu
 
   // byIndex (page_numInPage) is the ONLY matcher that survives an orientation change:
   // the device re-projects stroke geometry non-rigidly across rotation, so geom can't
-  // match, while numInPage ordering is untouched. It's normally gated because on an
-  // EDITED NOTE the indices reflow and byIndex would bleed a colour onto an uncoloured
-  // drifted stroke. Enable it when:
-  //   (a) the whole page is geom-shifted (geomMatchCount === 0 = pure orientation), OR
-  //   (b) this is a DOCUMENT (drawUncolored === true) — doc annotation indices are
-  //       STABLE (erased strokes leave numInPage GAPS, indices are never reused), so
-  //       byIndex reliably recovers rotated strokes even on a page that MIXES portrait
-  //       (geom-matched) and rotated annotations. Notes keep the strict gate.
-  const allowIndex = hasGeom && totalStrokes > 0 && (geomMatchCount === 0 || drawUncolored);
+  // match, while numInPage ordering is untouched. But byIndex maps purely by POSITION, so
+  // on an edited page it bleeds a deleted stroke's colour onto whatever new stroke now sits
+  // at that index — the "rainbow" ghost colours. The old code trusted byIndex on every
+  // DOCUMENT (assuming doc indices are never reused), but erase-and-rewrite DOES reuse them.
+  // So enable byIndex ONLY for a PURE orientation flip (geomMatchCount === 0 = nothing geom-
+  // matches, so there's no edited content to corrupt). Any page that has even one geom match
+  // is treated as live/edited → byIndex stays gated, and unmatched strokes fall back to their
+  // native pen colour instead of inheriting a ghost.
+  const allowIndex = hasGeom && totalStrokes > 0 && geomMatchCount === 0;
 
   // A note (drawUncolored=false) with size data needs the white-out: erase each
   // sized marker's native footprint and preserve every other stroke's footprint.

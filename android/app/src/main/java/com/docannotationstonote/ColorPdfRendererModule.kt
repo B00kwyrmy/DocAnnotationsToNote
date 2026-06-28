@@ -713,6 +713,56 @@ class ColorPdfRendererModule(reactContext: ReactApplicationContext)
         }
     }
 
+    // Trim blank (near-white) margins off ALL FOUR sides of a PNG so the strip hugs its real content.
+    // A full-page-width context strip carries the page's left margin as whitespace (indent / "shifted
+    // right") and blank top/bottom rows (the "gap"); this crops to the actual content box.
+    @ReactMethod
+    fun trimPng(inPath: String, outPath: String, pad: Int, promise: Promise) {
+        try {
+            val bmp = BitmapFactory.decodeFile(inPath) ?: throw RuntimeException("decode failed: $inPath")
+            val w = bmp.width; val h = bmp.height
+            val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
+            var minX = w; var maxX = -1; var minY = h; var maxY = -1
+            for (y in 0 until h) {
+                val row = y * w
+                for (x in 0 until w) {
+                    val p = px[row + x]
+                    if (Color.alpha(p) >= 16 && (Color.red(p) < 238 || Color.green(p) < 238 || Color.blue(p) < 238)) {
+                        if (x < minX) minX = x; if (x > maxX) maxX = x
+                        if (y < minY) minY = y; if (y > maxY) maxY = y
+                    }
+                }
+            }
+            if (maxX < 0) { promise.resolve(false); return }   // all blank
+            val x0 = (minX - pad).coerceAtLeast(0); val x1 = (maxX + pad).coerceAtMost(w - 1)
+            val y0 = (minY - pad).coerceAtLeast(0); val y1 = (maxY + pad).coerceAtMost(h - 1)
+            val out = Bitmap.createBitmap(bmp, x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+            File(outPath).parentFile?.mkdirs()
+            FileOutputStream(outPath).use { out.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            promise.resolve(true)
+        } catch (t: Throwable) {
+            promise.reject("ETRIM", t.message ?: "trim failed", t)
+        }
+    }
+
+    // Resize a PNG to exact w×h. The note places a picture at its NATIVE pixel size and CLIPS it to
+    // the element box (it does NOT scale to fit), so a strip wider than its box loses its right edge
+    // on-device. Pre-resizing to the display size makes native size == box → nothing to clip.
+    @ReactMethod
+    fun resizePng(inPath: String, outPath: String, w: Int, h: Int, promise: Promise) {
+        try {
+            if (w <= 0 || h <= 0) { promise.resolve(false); return }
+            val bmp = BitmapFactory.decodeFile(inPath) ?: throw RuntimeException("decode failed: $inPath")
+            val scaled = Bitmap.createScaledBitmap(bmp, w, h, true)
+            bmp.recycle()
+            File(outPath).parentFile?.mkdirs()
+            FileOutputStream(outPath).use { scaled.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            promise.resolve(true)
+        } catch (t: Throwable) {
+            promise.reject("ERESIZE", t.message ?: "resize failed", t)
+        }
+    }
+
     // Detect TEXT-LINE bands in a rendered page PNG by scanning for rows of DARK pixels (printed text
     // is dark; colour highlight washes are light, so they don't count). Returns flat quads
     // [top0,bot0,left0,right0, …] in image px — each band's vertical bounds AND the horizontal extent
@@ -890,47 +940,6 @@ class ColorPdfRendererModule(reactContext: ReactApplicationContext)
         } finally {
             try { renderer?.close() } catch (_: Throwable) {}
             try { pfd?.close() } catch (_: Throwable) {}
-        }
-    }
-
-    /**
-     * Compose one COLOR page (white bg) from text boxes + image crops at given px rects,
-     * → PNG. Used to build the standalone color output (PDF/PNG) so the colors survive
-     * (the e-ink note grayscales pictures). itemsJson = array of:
-     *   { kind:'text', text, left, top, right, bottom, fontSize }
-     *   { kind:'img',  path, left, top, right, bottom }
-     */
-    @ReactMethod
-    fun renderNotePagePng(width: Int, height: Int, itemsJson: String, outputPath: String, promise: Promise) {
-        try {
-            val bmp = Bitmap.createBitmap(width.coerceAtLeast(1), height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bmp)
-            canvas.drawColor(Color.WHITE)
-            val items = org.json.JSONArray(itemsJson)
-            for (i in 0 until items.length()) {
-                val it = items.getJSONObject(i)
-                val left = it.getInt("left"); val top = it.getInt("top")
-                val right = it.getInt("right"); val bottom = it.getInt("bottom")
-                if (it.getString("kind") == "text") {
-                    val tp = TextPaint().apply {
-                        color = Color.BLACK; isAntiAlias = true
-                        textSize = it.optDouble("fontSize", 32.0).toFloat()
-                    }
-                    val w = (right - left).coerceAtLeast(1)
-                    val s = it.optString("text", "")
-                    val layout = StaticLayout.Builder.obtain(s, 0, s.length, tp, w).build()
-                    canvas.save(); canvas.translate(left.toFloat(), top.toFloat()); layout.draw(canvas); canvas.restore()
-                } else {
-                    val img = BitmapFactory.decodeFile(it.optString("path", ""))
-                    if (img != null) { canvas.drawBitmap(img, null, Rect(left, top, right, bottom), null); img.recycle() }
-                }
-            }
-            File(outputPath).parentFile?.mkdirs()
-            FileOutputStream(outputPath).use { out -> bmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
-            bmp.recycle()
-            promise.resolve(outputPath)
-        } catch (t: Throwable) {
-            promise.reject("ERENDERPAGE", t.message ?: "render page failed", t)
         }
     }
 
